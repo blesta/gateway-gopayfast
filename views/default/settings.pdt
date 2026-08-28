@@ -1,0 +1,28 @@
+
+<div class="mb-3">
+    <?php
+    $this->Form->label($this->_('Gopayfast.meta.merchant_id', true), 'merchant_id', ['class' => 'form-label']);
+    $this->Form->fieldText('merchant_id', ($meta['merchant_id'] ?? null), ['id' => 'merchant_id', 'class' => 'form-control']);
+    ?>
+</div>
+<div class="mb-3">
+    <?php
+    $this->Form->label($this->_('Gopayfast.meta.merchant_name', true), 'merchant_name', ['class' => 'form-label']);
+    $this->Form->fieldText('merchant_name', ($meta['merchant_name'] ?? null), ['id' => 'merchant_name', 'class' => 'form-control']);
+    ?>
+    <div class="form-text"><?php $this->_('Gopayfast.meta.merchant_name_note');?></div>
+</div>
+<div class="mb-3">
+    <?php
+    $this->Form->label($this->_('Gopayfast.meta.secured_key', true), 'secured_key', ['class' => 'form-label']);
+    $this->Form->fieldText('secured_key', ($meta['secured_key'] ?? null), ['id' => 'secured_key', 'class' => 'form-control']);
+    ?>
+</div>
+<div class="mb-3">
+    <div class="form-check">
+        <?php
+        $this->Form->fieldCheckbox('sandbox', 'true', (($meta['sandbox'] ?? 'false') == 'true'), ['id' => 'sandbox', 'class' => 'form-check-input']);
+        $this->Form->label($this->_('Gopayfast.meta.sandbox', true), 'sandbox', ['class' => 'form-check-label']);
+        ?>
+    </div>
+</div>

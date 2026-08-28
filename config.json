@@ -1,0 +1,19 @@
+{
+    "version": "1.0.0",
+    "name": "Gopayfast.name",
+    "description": "Gopayfast.description",
+    "authors": [
+        {
+            "name": "Phillips Data, Inc.",
+            "url": "https://blesta.com/"
+        }
+    ],
+    "currencies": [
+        "PKR"
+    ],
+    "signup_url": "https://gopayfast.com/",
+    "logo": {
+        "light": "views/default/images/logo.svg",
+        "dark": "views/default/images/logo-dark.svg"
+    }
+}

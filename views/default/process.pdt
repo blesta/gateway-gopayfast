@@ -1,0 +1,26 @@
+<?php
+// The payment form is rendered inside the client area, which may be running either
+// the bootstrap template (Bootstrap 4, FontAwesome) or meridian (Bootstrap 5, Bootstrap
+// Icons). Every class used below exists in both, only the icon set differs.
+$icon = (($template ?? 'bootstrap') == 'meridian' ? 'bi bi-lock-fill' : 'fa fa-lock');
+
+// Disable CSRF for this form, it posts to PayFast rather than back to Blesta
+$this->Form->setCsrfOptions(['set_on_create' => false]);
+$this->Form->create(($post_to ?? null), ['id' => 'gopayfast-payment-form']);
+
+// Set payment fields
+if (($fields ?? null)) {
+    foreach ($fields as $key => $value) {
+        $this->Form->fieldHidden($key, $value);
+    }
+}
+?>
+<div class="text-center mb-3">
+    <button type="submit" class="btn btn-primary btn-lg">
+        <i class="<?php echo $this->Html->safe($icon);?>"></i>
+        <?php $this->_('Gopayfast.buildprocess.submit');?>
+    </button>
+</div>
+<p class="text-center mb-0"><small><?php $this->_('Gopayfast.buildprocess.description');?></small></p>
+<?php
+$this->Form->end();

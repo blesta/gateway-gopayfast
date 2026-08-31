@@ -15,7 +15,7 @@ if (($fields ?? null)) {
     }
 }
 ?>
-<div class="text-center mb-3">
+<div class="text-right mt-2">
     <button type="submit" class="btn btn-primary btn-lg">
         <i class="<?php echo $this->Html->safe($icon);?>"></i>
         <?php $this->_('Gopayfast.buildprocess.submit');?>
@@ -24,3 +24,44 @@ if (($fields ?? null)) {
 <p class="text-center mb-0"><small><?php $this->_('Gopayfast.buildprocess.description');?></small></p>
 <?php
 $this->Form->end();
+?>
+<script>
+(function () {
+    var payment_form = document.getElementById('gopayfast-payment-form');
+
+    if (!payment_form) {
+        return;
+    }
+
+    // How long the client is given to read the page before being sent to PayFast
+    var submit_delay = 10000;
+    var submitted = false;
+    var mark_submitted = function () {
+        submitted = true;
+    };
+
+    // A client who presses the button first must not be submitted a second time when the
+    // timer fires. The page around this form may be jQuery or vanilla, and a submit event
+    // does not cross between the two, so listen in both worlds
+    payment_form.addEventListener('submit', mark_submitted);
+
+    if (window.jQuery) {
+        window.jQuery(payment_form).on('submit', mark_submitted);
+    }
+
+    window.setTimeout(function () {
+        if (submitted) {
+            return;
+        }
+
+        // Dispatch a real event rather than calling submit() straight away, so any
+        // handler the surrounding page has bound still runs and can cancel the payment
+        var submit_event = new Event('submit', {bubbles: true, cancelable: true});
+
+        if (payment_form.dispatchEvent(submit_event)) {
+            submitted = true;
+            payment_form.submit();
+        }
+    }, submit_delay);
+})();
+</script>

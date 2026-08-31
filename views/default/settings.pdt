@@ -25,4 +25,5 @@
         $this->Form->label($this->_('Gopayfast.meta.sandbox', true), 'sandbox', ['class' => 'form-check-label']);
         ?>
     </div>
+    <div class="form-text"><?php $this->_('Gopayfast.meta.sandbox_note');?></div>
 </div>

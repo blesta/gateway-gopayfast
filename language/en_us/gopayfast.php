@@ -3,7 +3,7 @@
  * en_us language for the PayFast (Pakistan) gateway.
  */
 // Basics
-$lang['Gopayfast.name'] = 'PayFast';
+$lang['Gopayfast.name'] = 'PayFast (Pakistan)';
 $lang['Gopayfast.description'] = 'Accept card, wallet and bank payments in Pakistani Rupees through PayFast\'s hosted checkout.';
 
 
@@ -17,9 +17,10 @@ $lang['Gopayfast.!error.sandbox.valid'] = 'Sandbox value invalid.';
 // Settings
 $lang['Gopayfast.meta.merchant_id'] = 'Merchant ID';
 $lang['Gopayfast.meta.merchant_name'] = 'Merchant Name';
-$lang['Gopayfast.meta.merchant_name_note'] = 'Must match the merchant name registered with PayFast, it forms part of the payment signature.';
+$lang['Gopayfast.meta.merchant_name_note'] = 'The merchant name registered with PayFast, shown to the client on the payment page.';
 $lang['Gopayfast.meta.secured_key'] = 'Secured Key';
 $lang['Gopayfast.meta.sandbox'] = 'Sandbox';
+$lang['Gopayfast.meta.sandbox_note'] = 'Sends payments to PayFast\'s UAT environment for testing, rather than the live one.';
 
 
 // Process

@@ -7,19 +7,28 @@
  * the payment to PostTransaction carrying that token. The basket ID and amount must be
  * identical across both calls or PayFast rejects the transaction.
  *
- * The callback that reports the outcome is not trusted. It only names a basket ID, which
- * is then looked up against PayFast over an authenticated server to server call, and the
- * status, amount, currency and transaction ID all come from that record. Anything that
- * cannot be verified is rejected rather than recorded.
+ * PayFast reports the outcome by sending an IPN to CHECKOUT_URL, carrying the detail in
+ * the query string. It arrives over the open internet, so it is checked before it is
+ * believed, in three steps:
  *
- * Two details were derived from PayFast's merchant integration guide and working live
- * integrations rather than the official reference, which is behind a bot check, and
- * should be confirmed before this handles production traffic:
+ *  - It must carry PayFast's validation hash, the SHA256 of
+ *    "basket_id|secured_key|merchant_id|err_code". Only PayFast holds the secured key,
+ *    so a matching hash proves the notification is genuine and that the basket ID and
+ *    error code in it are untampered.
+ *  - The basket ID must be one this gateway issued for this client.
+ *  - The amount is not covered by the hash, so it is read back from PayFast's transaction
+ *    status API rather than taken from the notification. The lookup names the transaction
+ *    ID the notification supplies, which is likewise not covered by the hash, so the
+ *    record that comes back must point at the basket ID that was hashed. An attacker can
+ *    name any transaction, but not one whose record points at someone else's basket.
  *
- *  - Success is taken to be an err_code of 000, 00 or 0.
- *  - The API base for the verification lookup is assumed to share the payment endpoints'
- *    base, giving {host}/Ecommerce/api/transaction/basket_id/{id}. It is isolated in
- *    getApiBaseUrl(). A wrong base rejects payments rather than approving bad ones.
+ * Anything that cannot be verified is rejected rather than recorded.
+ *
+ * Success is taken to be an error code of 000, 00 or 0, per PayFast's published error
+ * codes, where 00 is "Processed OK".
+ *
+ * Every call over the network lives in lib/gopayfast_api.php, which also selects between
+ * the live and UAT hosts. This class only decides what to send and how to record it.
  *
  * API documentation: https://gopayfast.com/docs/
  *
@@ -37,12 +46,9 @@ class Gopayfast extends NonmerchantGateway
     private $meta;
 
     /**
-     * @var array The API hosts, keyed by environment
+     * @var GopayfastApi The API for the configured environment
      */
-    private $api_hosts = [
-        'live' => 'https://ipg1.apps.net.pk',
-        'sandbox' => 'https://ipguat.apps.net.pk'
-    ];
+    private $api;
 
     /**
      * @var array Response codes PayFast returns for a successful transaction
@@ -72,6 +78,9 @@ class Gopayfast extends NonmerchantGateway
     public function setMeta(array $meta = null)
     {
         $this->meta = $meta;
+
+        // The API is configured from the meta data, discard one built from the old settings
+        $this->api = null;
     }
 
     /**
@@ -261,11 +270,10 @@ class Gopayfast extends NonmerchantGateway
             'SUCCESS_URL' => $redirect_url,
             'FAILURE_URL' => $redirect_url,
             'CHECKOUT_URL' => $callback_url,
-            'SIGNATURE' => $this->generateSignature($basket_id, $amount),
             'VERSION' => 'BLESTA-' . ($this->config->version ?? '1.0.0')
         ];
 
-        $post_to = $this->getApiUrl('PostTransaction');
+        $post_to = $this->getApi()->getFormUrl();
 
         $this->log($post_to, serialize($this->maskData($fields, ['TOKEN'])), 'input', true);
 
@@ -297,28 +305,43 @@ class Gopayfast extends NonmerchantGateway
      */
     public function validate(array $get, array $post)
     {
-        // PayFast has been observed posting the result and appending it to the callback
-        // URL as a query string, accept either
+        // PayFast sends the IPN with the transaction detail in the query string, accept
+        // it from either place
         $response = array_merge($get, $post);
 
-        // Nothing in the callback is trusted beyond the basket ID it names, everything
-        // that decides the outcome is read back from PayFast below
         $basket_id = $this->fieldValue($response, ['basket_id', 'BASKET_ID', 'order_no', 'ORDER_NO']);
-        $claimed_amount = $this->fieldValue($response, ['transaction_amount', 'TXNAMT', 'amount', 'AMOUNT']);
+        $transaction_id = $this->fieldValue($response, ['transaction_id', 'TRANSACTION_ID']);
+        $error_code = $this->fieldValue($response, ['err_code', 'ERR_CODE']);
 
         $this->log(($_SERVER['REQUEST_URI'] ?? null), serialize($response), 'output', true);
 
-        // The basket ID is issued by this gateway, a callback that does not carry one
-        // recognisable as ours is not a response to a payment we started
-        if (!$this->isOwnBasketId($basket_id, ($get['client_id'] ?? null))) {
+        // The validation hash is keyed on the secured key, so only PayFast can produce
+        // one. Without a matching hash this is not a notification from PayFast at all
+        if (!$this->validationHashMatches($response, $basket_id, $error_code)) {
             $this->Input->setErrors($this->getCommonError('invalid'));
 
             return;
         }
 
-        // Ask PayFast what actually happened. A payment that cannot be verified is not
-        // a payment, so every failure below records nothing
-        $transaction = $this->getTransaction($basket_id, $claimed_amount);
+        // The basket ID is issued by this gateway, a notification that does not carry one
+        // recognisable as ours is not a response to a payment we started
+        if (!$this->isOwnBasketId($basket_id, ($get['client_id'] ?? null)) || empty($transaction_id)) {
+            $this->Input->setErrors($this->getCommonError('invalid'));
+
+            return;
+        }
+
+        // The hash covers the error code, so this much can now be taken at face value.
+        // Rejecting here also saves verifying a payment that plainly did not succeed
+        if (!in_array((string) $error_code, $this->success_codes, true)) {
+            $this->Input->setErrors($this->getCommonError('invalid'));
+
+            return;
+        }
+
+        // The hash does not cover the amount, so it still has to be read back from
+        // PayFast. A payment that cannot be verified is not a payment
+        $transaction = $this->getTransaction($transaction_id);
         if (empty($transaction)) {
             $this->Input->setErrors($this->getCommonError('invalid'));
 
@@ -326,9 +349,27 @@ class Gopayfast extends NonmerchantGateway
         }
 
         $verified = (array) $transaction;
-        $error_code = $this->fieldValue($verified, ['err_code', 'ERR_CODE', 'status', 'STATUS', 'code', 'CODE']);
 
-        if (!in_array((string) $error_code, $this->success_codes, true)) {
+        // The transaction ID was named by the callback, so the record it returns is only
+        // this client's payment if it points back at the basket this gateway issued them
+        if ((string) ($verified['basket_id'] ?? '') !== (string) $basket_id) {
+            $this->Input->setErrors($this->getCommonError('invalid'));
+
+            return;
+        }
+
+        $status_code = $this->fieldValue(
+            $verified,
+            ['status_code', 'STATUS_CODE', 'err_code', 'ERR_CODE', 'code', 'CODE']
+        );
+        $amount = $this->fieldValue(
+            $verified,
+            ['purchase_amount', 'transaction_amount', 'TXNAMT', 'amount', 'AMOUNT', 'merchant_amount']
+        );
+
+        // An approval carries an amount, recording one without it would apply a payment
+        // of nothing against the invoices
+        if (!in_array((string) $status_code, $this->success_codes, true) || $amount === null) {
             $this->Input->setErrors($this->getCommonError('invalid'));
 
             return;
@@ -336,16 +377,12 @@ class Gopayfast extends NonmerchantGateway
 
         return [
             'client_id' => ($get['client_id'] ?? null),
-            'amount' => $this->fieldValue(
-                $verified,
-                ['transaction_amount', 'TXNAMT', 'amount', 'AMOUNT', 'merchant_amount']
-            ),
-            'currency' => $this->fieldValue($verified, ['transaction_currency', 'CURRENCY_CODE', 'currency'])
-                ?: ($this->currency ?? 'PKR'),
+            'amount' => $amount,
+            'currency' => ($this->currency ?? 'PKR'),
             'invoices' => $this->deSerializeInvoices($get['invoices'] ?? null),
             'status' => 'approved',
             'reference_id' => $basket_id,
-            'transaction_id' => $this->fieldValue($verified, ['transaction_id', 'TRANSACTION_ID']),
+            'transaction_id' => $this->fieldValue($verified, ['transaction_id', 'TRANSACTION_ID']) ?: $transaction_id,
             'parent_transaction_id' => null
         ];
     }
@@ -370,7 +407,10 @@ class Gopayfast extends NonmerchantGateway
     public function success(array $get, array $post)
     {
         $response = array_merge($get, $post);
-        $error_code = $this->fieldValue($response, ['err_code', 'ERR_CODE', 'status', 'STATUS']);
+        $error_code = $this->fieldValue(
+            $response,
+            ['err_code', 'ERR_CODE', 'status_code', 'STATUS_CODE', 'status', 'STATUS']
+        );
 
         // The client is returned to this page for both outcomes, PayFast is given the same
         // URL for SUCCESS_URL and FAILURE_URL. The transaction is only recorded by validate(),
@@ -398,26 +438,24 @@ class Gopayfast extends NonmerchantGateway
      */
     private function getAccessToken($basket_id, $amount)
     {
-        if (!isset($this->Http)) {
-            Loader::loadComponents($this, ['Net']);
-            $this->Http = $this->Net->create('Http');
-        }
+        $api = $this->getApi();
+        $response = $api->getAccessToken($basket_id, $amount, ($this->currency ?? 'PKR'));
 
-        $params = [
-            'MERCHANT_ID' => ($this->meta['merchant_id'] ?? null),
-            'SECURED_KEY' => ($this->meta['secured_key'] ?? null),
-            'BASKET_ID' => $basket_id,
-            'TXNAMT' => $amount,
-            'CURRENCY_CODE' => ($this->currency ?? 'PKR')
-        ];
-
-        $url = $this->getApiUrl('GetAccessToken');
-        $this->log($url, serialize($this->maskData($params, ['SECURED_KEY'])), 'input', true);
-
-        $response = json_decode($this->Http->post($url, http_build_query($params)));
+        $request = $api->lastRequest();
         $token = ($response->ACCESS_TOKEN ?? null);
 
-        $this->log($url, serialize($this->maskData((array) $response, ['ACCESS_TOKEN'])), 'output', !empty($token));
+        $this->log(
+            $request['url'],
+            serialize($this->maskData($request['params'], ['SECURED_KEY'])),
+            'input',
+            true
+        );
+        $this->log(
+            $request['url'],
+            serialize($this->maskData((array) $response, ['ACCESS_TOKEN'])),
+            'output',
+            !empty($token)
+        );
 
         return $token;
     }
@@ -426,82 +464,80 @@ class Gopayfast extends NonmerchantGateway
      * Fetches the authoritative record of a transaction from PayFast.
      *
      * The callback carries the outcome as query/POST data, which anyone can forge. This
-     * asks PayFast directly instead. The lookup is by basket ID rather than transaction
-     * ID because the basket ID is issued by this gateway, so an attacker cannot choose
-     * which record is inspected.
+     * asks PayFast directly instead. The caller is responsible for checking the record
+     * that comes back belongs to the payment it is recording, see validate().
      *
-     * @param string $basket_id The basket ID issued for the payment attempt
-     * @param string $amount The amount claimed by the callback, used to obtain a token
+     * @param string $transaction_id The ID PayFast assigned the transaction
      * @return stdClass The transaction record, or null if it could not be retrieved
      */
-    private function getTransaction($basket_id, $amount)
+    private function getTransaction($transaction_id)
     {
-        $token = $this->getAccessToken($basket_id, $amount);
+        $token = $this->getStatusToken();
         if (empty($token)) {
             return null;
         }
 
-        if (!isset($this->Http)) {
-            Loader::loadComponents($this, ['Net']);
-            $this->Http = $this->Net->create('Http');
-        }
+        $api = $this->getApi();
+        $transaction = $api->getTransaction($transaction_id, $token);
 
-        $url = $this->getApiBaseUrl() . 'transaction/basket_id/' . rawurlencode($basket_id);
+        $url = $api->lastRequest()['url'];
+        $success = ($api->responseCode() == 200) && !empty($transaction);
 
-        $this->Http->setHeaders([
-            'Content-Type: application/x-www-form-urlencoded',
-            'Authorization: Bearer ' . $token
-        ]);
-
-        $this->log($url, serialize(['basket_id' => $basket_id]), 'input', true);
-
-        $body = $this->Http->get($url);
-        $transaction = json_decode((string) $body);
-        $success = ($this->Http->responseCode() == 200) && is_object($transaction);
-
-        $this->log($url, serialize($success ? $transaction : (string) $body), 'output', $success);
+        $this->log($url, serialize(['transaction_id' => $transaction_id]), 'input', true);
+        $this->log($url, serialize($success ? $transaction : $api->lastResponse()), 'output', $success);
 
         return $success ? $transaction : null;
     }
 
     /**
-     * Builds the base URL of the API for the configured environment
+     * Requests a bearer token for the transaction status API. This is a separate
+     * credential from the access token that authorises a payment.
      *
-     * @return string The API base URL, with a trailing slash
+     * @return string The bearer token, or null on failure
      */
-    private function getApiBaseUrl()
+    private function getStatusToken()
     {
-        $host = $this->api_hosts[($this->meta['sandbox'] ?? 'false') == 'true' ? 'sandbox' : 'live'];
+        $api = $this->getApi();
+        $response = $api->getStatusToken();
 
-        return $host . '/Ecommerce/api/';
-    }
+        $request = $api->lastRequest();
+        $token = ($response->token ?? null);
 
-    /**
-     * Builds the URL of the given payment endpoint for the configured environment
-     *
-     * @param string $endpoint The name of the endpoint
-     * @return string The full endpoint URL
-     */
-    private function getApiUrl($endpoint)
-    {
-        return $this->getApiBaseUrl() . 'Transaction/' . $endpoint;
-    }
-
-    /**
-     * Generates the MD5 signature PayFast uses to verify the integrity of the payment request
-     *
-     * @param string $basket_id The unique ID of this payment attempt
-     * @param string $amount The amount to be charged
-     * @return string The MD5 signature
-     */
-    private function generateSignature($basket_id, $amount)
-    {
-        return md5(
-            ($this->meta['merchant_id'] ?? '') . ':'
-            . ($this->meta['merchant_name'] ?? '') . ':'
-            . $amount . ':'
-            . $basket_id
+        $this->log(
+            $request['url'],
+            serialize($this->maskData($request['params'], ['secured_key'])),
+            'input',
+            true
         );
+        $this->log(
+            $request['url'],
+            serialize($this->maskData((array) $response, ['token', 'refresh_token'])),
+            'output',
+            !empty($token)
+        );
+
+        return $token;
+    }
+
+    /**
+     * Loads the API, configured for the environment these settings select. Sandbox
+     * sends every request to PayFast's UAT host instead of the live one.
+     *
+     * @return GopayfastApi The API
+     */
+    private function getApi()
+    {
+        if (!isset($this->api)) {
+            Loader::load(dirname(__FILE__) . DS . 'lib' . DS . 'gopayfast_api.php');
+
+            $this->api = new GopayfastApi(
+                ($this->meta['merchant_id'] ?? null),
+                ($this->meta['secured_key'] ?? null),
+                ($this->meta['sandbox'] ?? 'false') == 'true'
+            );
+        }
+
+        return $this->api;
     }
 
     /**
@@ -513,6 +549,29 @@ class Gopayfast extends NonmerchantGateway
     private function buildBasketId($client_id)
     {
         return 'BLESTA-' . (int) $client_id . '-' . time() . '-' . mt_rand(1000, 9999);
+    }
+
+    /**
+     * Checks the validation hash PayFast sends with a notification against the one this
+     * merchant's secured key produces for the same basket ID and error code.
+     *
+     * @param array $response The notification data
+     * @param string $basket_id The basket ID the notification names
+     * @param string $error_code The error code the notification carries
+     * @return bool True if the notification carries a hash that matches
+     */
+    private function validationHashMatches(array $response, $basket_id, $error_code)
+    {
+        $received = $this->fieldValue(
+            $response,
+            ['validation_hash', 'VALIDATION_HASH', 'validate_hash', 'VALIDATE_HASH', 'hash', 'HASH']
+        );
+
+        if (empty($received) || $basket_id === null || $error_code === null) {
+            return false;
+        }
+
+        return hash_equals($this->getApi()->getValidationHash($basket_id, $error_code), (string) $received);
     }
 
     /**
